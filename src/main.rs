@@ -9,7 +9,7 @@ use teloxide::{
     dispatching::dialogue::InMemStorage,
     prelude::*,
     types::{
-        InlineKeyboardButton, InlineKeyboardMarkup,
+        CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
         KeyboardButton, KeyboardMarkup,
     },
     utils::command::BotCommands,
@@ -55,6 +55,8 @@ pub struct Config {
     pub whisper_url: String,
     pub deemix_bitrate: u8,
     pub deemix_bitrate_lock: bool,
+    pub whitelist_enabled: bool,
+    pub whitelist_ids: Vec<i64>,
 }
 
 impl Config {
@@ -76,12 +78,25 @@ impl Config {
             whisper_url: env::var("WHISPER_URL").unwrap_or_default(),
             deemix_bitrate: env::var("DEEMIX_BITRATE").unwrap_or_else(|_| "9".to_string()).parse().unwrap_or(9),
             deemix_bitrate_lock: env::var("DEEMIX_BITRATE_LOCK").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true",
+            whitelist_enabled: env::var("WHITELIST_ENABLED").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true",
+            whitelist_ids: env::var("WHITELIST_IDS").unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<i64>().ok())
+                .collect(),
         }
     }
 
 
     pub fn audd_enabled(&self) -> bool { !self.audd_api_key.is_empty() }
     pub fn whisper_enabled(&self) -> bool { !self.openai_api_key.is_empty() || !self.whisper_url.is_empty() }
+    pub fn is_user_allowed(&self, user_id: i64) -> bool {
+        !self.whitelist_enabled || self.whitelist_ids.contains(&user_id)
+    }
+    pub fn is_whitelist_empty(&self) -> bool {
+        self.whitelist_enabled && self.whitelist_ids.is_empty()
+    }
 }
 
 // ── Bot State ─────────────────────────────────────────────────────────────────
@@ -178,6 +193,9 @@ async fn main() {
     pretty_env_logger::init();
 
     let config = Config::from_env();
+    if config.is_whitelist_empty() {
+        log::warn!("Whitelist is enabled but WHITELIST_IDS is empty. All users will be blocked until configured.");
+    }
     let users = users::load(&config.users_file);
     let state = Arc::new(BotState::new(config, users));
 
@@ -199,6 +217,23 @@ async fn main() {
     let storage = InMemStorage::<State>::new();
 
     let handler = dptree::entry()
+        // Whitelist: block unauthorized messages
+        .branch(
+            Update::filter_message()
+            .filter(|msg: Message, state: Arc<BotState>| {
+                let user_id = msg.from().map(|u| u.id.0 as i64).unwrap_or(0);
+                !state.config.is_user_allowed(user_id)
+            })
+            .endpoint(handle_unauthorized_message),
+        )
+        // Whitelist: block unauthorized callbacks
+        .branch(
+            Update::filter_callback_query()
+            .filter(|query: CallbackQuery, state: Arc<BotState>| {
+                !state.config.is_user_allowed(query.from.id.0 as i64)
+            })
+            .endpoint(handle_unauthorized_callback),
+        )
         .branch(
             Update::filter_message()
                 .enter_dialogue::<Message, InMemStorage<State>, State>()
@@ -295,6 +330,34 @@ fn main_keyboard(s: &UserSettings, config: &Config) -> KeyboardMarkup {
     ]);
 
     KeyboardMarkup::new(rows).resize_keyboard(true)
+}
+
+// ── Unauthorized Handlers ────────────────────────────────────────────────────
+async fn handle_unauthorized_message(
+    bot: Bot,
+    msg: Message,
+    state: Arc<BotState>,
+) -> ResponseResult<()> {
+    if state.config.is_whitelist_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "⚠️ The user list is empty.\nAdd users to the whitelist or disable the user filtering feature.",
+        ).await?;
+    }
+    Ok(())
+}
+
+async fn handle_unauthorized_callback(
+    bot: Bot,
+    query: CallbackQuery,
+    state: Arc<BotState>,
+) -> ResponseResult<()> {
+    if state.config.is_whitelist_empty() {
+        bot.answer_callback_query(&query.id)
+            .text("⚠️ The user list is empty.\nAdd users to the whitelist or disable the user filtering feature.")
+            .await?;
+    }
+    Ok(())
 }
 
 // ── Command Handler ───────────────────────────────────────────────────────────
